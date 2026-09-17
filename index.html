@@ -221,6 +221,7 @@ const hoy = () => new Date();
 const hoyKey = () => ym(hoy());
 
 /* ---------- 2. Datos ---------- */
+const APP_VERSION = "1.4";
 const STORE = "planificador.v2";
 
 /* Cada cuánto entra la plata. n = cuántos depósitos esperar en un mes. */
@@ -251,6 +252,19 @@ function probarAlmacenamiento() {
   } catch (e) { return false; }
 }
 let puedeGuardar = probarAlmacenamiento();
+
+/* ¿Está corriendo instalada o dentro del navegador? ¿Tiene soporte sin conexión? */
+const modoApp = () => {
+  try {
+    if (navigator.standalone === true) return true;
+    if (typeof matchMedia === "function") return matchMedia("(display-mode: standalone)").matches;
+  } catch (e) {}
+  return false;
+};
+const direccion = () => {
+  try { return (location.host || "") + (location.pathname || ""); } catch (e) { return "—"; }
+};
+let swActivo = false;
 
 function cargar() {
   try {
@@ -850,7 +864,28 @@ function hojaAjustes() {
     <button class="row" data-act="borrarTodo">
       <div class="stack"><div class="name danger">Borrar todo y empezar de cero</div><div class="note">No se puede deshacer</div></div>
     </button>
-    <div style="padding:24px 20px 40px" class="note">Planificador 1.0 · ${esc(mesLargo(k))} · CRC</div>
+    <div style="padding:22px 20px 6px" class="eyebrow">Esta instalación</div>
+    <div class="row">
+      <div class="stack"><div class="name">Dirección</div>
+        <div class="note">De aquí se carga la app</div></div>
+      <div class="note" style="color:var(--ink);max-width:56%;text-align:right;word-break:break-all">${esc(direccion())}</div>
+    </div>
+    <div class="row">
+      <div class="stack"><div class="name">Modo</div>
+        <div class="note">${modoApp() ? "Abierta desde la pantalla de inicio" : "Abierta dentro del navegador"}</div></div>
+      <div class="note" style="color:var(--ink)">${modoApp() ? "App" : "Navegador"}</div>
+    </div>
+    <div class="row">
+      <div class="stack"><div class="name">Sin conexión</div>
+        <div class="note">${swActivo ? "Abre aunque no haya internet" : "Falta subir sw.js al repositorio"}</div></div>
+      <div class="note" style="color:${swActivo ? "var(--ink)" : "var(--red)"}">${swActivo ? "Listo" : "No"}</div>
+    </div>
+    <button class="row" data-act="buscarActualizacion">
+      <div class="stack"><div class="name">Buscar actualización</div>
+        <div class="note">Vuelve a pedir la última versión publicada</div></div>
+      <div class="note" style="color:var(--ink)">v${APP_VERSION}</div>
+    </button>
+    <div style="padding:24px 20px 40px" class="note">Planificador v${APP_VERSION} · ${esc(mesLargo(k))} · CRC</div>
   </div>
   <div class="sheet-foot"></div>`;
 }
@@ -1184,6 +1219,18 @@ const ACCIONES = {
     guardar(); ACCIONES.cerrar(); avisar("Categoría eliminada");
   },
 
+  buscarActualizacion() {
+    avisar("Buscando la última versión…");
+    const listo = () => setTimeout(() => location.reload(), 600);
+    try {
+      if ("serviceWorker" in navigator && navigator.serviceWorker.getRegistration) {
+        navigator.serviceWorker.getRegistration()
+          .then(r => (r ? r.update() : null))
+          .then(listo, listo);
+      } else listo();
+    } catch (e) { listo(); }
+  },
+
   copiarCSV() {
     const filas = [["fecha", "comercio", "categoria", "monto"]].concat(
       D.movs.slice().sort((a, b) => a.fecha.localeCompare(b.fecha)).map(m =>
@@ -1248,7 +1295,9 @@ render();
 /* Service worker: solo funciona si el archivo sw.js existe junto al index.
    En un hosting propio da soporte sin conexión; si no está, falla en silencio. */
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js").catch(() => {});
+  navigator.serviceWorker.register("./sw.js")
+    .then(r => { swActivo = !!(r && (r.active || r.installing)); render(); })
+    .catch(() => {});
 }
 </script>
 </body>
