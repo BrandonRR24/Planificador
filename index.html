@@ -151,6 +151,7 @@ input:focus{outline:none}
 .field label{font:600 10.5px/1 Archivo,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
 .field input{font:600 15px/1.2 Archivo,sans-serif;padding:2px 0}
 .field input::placeholder{color:var(--faint)}
+.field input[type=date]{-webkit-appearance:none;appearance:none;background:transparent;min-height:24px}
 
 /* ===== Calendario ===== */
 .dow{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--hair)}
@@ -179,6 +180,10 @@ input:focus{outline:none}
 .spark{display:flex;align-items:flex-end;gap:3px;height:80px;margin-top:4px}
 .spark i{flex:1;background:var(--ink);display:block}
 .danger{color:var(--red)}
+.nudge{padding:16px 20px;border-bottom:2px solid var(--ink);background:var(--tint);
+  display:flex;flex-direction:column;gap:7px}
+.nudge b{font:700 14px/1.3 Archivo,sans-serif}
+.nudge .prose{color:var(--ink)}
 .aviso{padding:16px 20px;border-bottom:2px solid var(--red);background:var(--alert);
   display:flex;flex-direction:column;gap:7px}
 .aviso b{font:700 13px/1.3 Archivo,sans-serif;color:var(--red-ink)}
@@ -218,12 +223,20 @@ const hoyKey = () => ym(hoy());
 /* ---------- 2. Datos ---------- */
 const STORE = "planificador.v2";
 
+/* Cada cuánto entra la plata. n = cuántos depósitos esperar en un mes. */
+const FREQ = {
+  semanal:    { label: "Semanal",    corto: "por semana",   n: 4 },
+  quincenal:  { label: "Quincenal",  corto: "por quincena", n: 2 },
+  mensual:    { label: "Mensual",    corto: "por mes",      n: 1 }
+};
+
 const PALETA = ["#201e1d", "#605d5d", "#9b9797", "#ec3013", "#bab6b6", "#444141", "#7d7979"];
 const SUGERIDAS = ["Casa", "Comida", "Transporte", "Ocio", "Salud", "Ahorro", "Deudas", "Educación"];
 
 /* Arranca en blanco a propósito: los números solo sirven si son tuyos. */
 function semilla() {
-  return { v: 1, setup: false, ingreso: 0, cats: [], movs: [], metas: [], pagos: [], reglas: {}, tasa: 8 };
+  return { v: 2, setup: false, frecuencia: "mensual", esperado: 0,
+           pospuesto: null, cats: [], movs: [], metas: [], pagos: [], reglas: {}, tasa: 8 };
 }
 
 /* ¿Este entorno permite guardar? No alcanza con que exista localStorage:
@@ -246,6 +259,16 @@ function cargar() {
     const d = JSON.parse(raw);
     if (!d || !d.cats) return semilla();
     if (d.setup === undefined) d.setup = d.cats.length > 0;
+    if (d.frecuencia === undefined) {
+      d.frecuencia = "mensual";
+      d.esperado = d.ingreso || 0;
+      if (d.ingreso > 0 && !(d.movs || []).some(m => m.ingreso)) {
+        d.movs = d.movs || [];
+        d.movs.push({ id: uid(), ingreso: true, comercio: "Ingreso", monto: d.ingreso,
+                      cat: null, fecha: hoyKey() + "-01" });
+      }
+      delete d.ingreso;
+    }
     return d;
   } catch (e) { return semilla(); }
 }
@@ -258,7 +281,7 @@ let D = cargar();
 
 /* Estado de pantalla: no se guarda, se reconstruye en cada apertura. */
 let U = { tab: "resumen", mes: hoyKey(), sheet: null, arg: null,
-          draft: "", draftCat: null, draftTexto: "", diaSel: null, scroll: {}, paso: 1, catsSel: [] };
+          draft: "", draftCat: null, draftTexto: "", draftFecha: "", diaSel: null, scroll: {}, paso: 1, catsSel: [], freq: "mensual" };
 
 /* ---------- 3. Cálculos ---------- */
 const catPorId = id => D.cats.find(c => c.id === id);
@@ -267,6 +290,39 @@ const gastadoCat = (id, k) => movsDelMes(k).filter(m => m.cat === id && m.monto 
   .reduce((a, m) => a - m.monto, 0);
 const gastadoTotal = k => movsDelMes(k).filter(m => m.monto < 0).reduce((a, m) => a - m.monto, 0);
 const planeado = () => D.cats.reduce((a, c) => a + c.plan, 0);
+/* Lo recibido es la suma de depósitos reales, no un número fijo. */
+const depositosDelMes = k => movsDelMes(k).filter(m => m.ingreso).sort((a, b) => a.fecha.localeCompare(b.fecha));
+const recibidoDelMes = k => depositosDelMes(k).reduce((a, m) => a + m.monto, 0);
+const isoDe = d => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+const diaISO = iso => new Date(iso + "T12:00:00");   // mediodía: evita que la zona horaria corra el día
+const diasEntre = (a, b) => Math.round((diaISO(b) - diaISO(a)) / 86400000);
+const fechaCorta = iso => Number(iso.slice(8)) + " " + MESES[Number(iso.slice(5, 7)) - 1].slice(0, 3);
+
+/* El próximo pago NO se pregunta: se deduce del último depósito + la frecuencia.
+   Sin historial no hay predicción, y por lo tanto tampoco recordatorio. */
+const ultimoDeposito = () => D.movs.filter(m => m.ingreso).sort((a, b) => b.fecha.localeCompare(a.fecha))[0];
+function proximoEsperado() {
+  const u = ultimoDeposito();
+  if (!u) return null;
+  const d = diaISO(u.fecha);
+  if (D.frecuencia === "mensual") d.setMonth(d.getMonth() + 1);
+  else d.setDate(d.getDate() + (D.frecuencia === "semanal" ? 7 : 15));
+  return isoDe(d);
+}
+/* Hay recordatorio cuando la fecha deducida ya llegó y todavía no registraste nada después. */
+function recordatorioPago() {
+  const prox = proximoEsperado();
+  if (!prox || U.mes !== hoyKey()) return null;
+  const h = isoDe(hoy());
+  if (prox > h) return null;
+  if (D.pospuesto && D.pospuesto > h) return null;
+  return { fecha: prox, dias: diasEntre(prox, h) };
+}
+
+const fechaSugerida = () => U.mes === hoyKey()
+  ? U.mes + "-" + String(hoy().getDate()).padStart(2, "0")
+  : U.mes + "-01";
+const esperadoDelMes = () => (D.esperado || 0) * (FREQ[D.frecuencia] || FREQ.mensual).n;
 
 function diasRestantes(k) {
   const t = daysIn(k);
@@ -293,10 +349,13 @@ function alerta(k) {
 
 /* ---------- 4. Vistas ---------- */
 function vistaResumen() {
-  const k = U.mes, ing = D.ingreso, gast = gastadoTotal(k), plan = planeado();
-  const disp = ing - gast, dias = diasRestantes(k);
+  const k = U.mes, gast = gastadoTotal(k);
+  const recibido = recibidoDelMes(k), deps = depositosDelMes(k);
+  const disp = recibido - gast, dias = diasRestantes(k);
   const a = alerta(k);
-  const ahorroPct = ing > 0 ? Math.round((disp / ing) * 100) : 0;
+  const ahorroPct = recibido > 0 ? Math.round((disp / recibido) * 100) : 0;
+  const f = FREQ[D.frecuencia] || FREQ.mensual;
+  const rec = recordatorioPago(), prox = proximoEsperado();
   return `
   <div class="head">
     <div class="head-col">
@@ -310,17 +369,42 @@ function vistaResumen() {
     <button class="chip" data-act="sheet" data-arg="ajustes">Ajustes</button>
   </div>
   <div class="scroll" id="sc">
+    ${rec ? `<div class="nudge">
+      <b>${rec.dias === 0 ? "Hoy toca tu pago " + f.label.toLowerCase() : "¿Ya te cayó el pago?"}</b>
+      <div class="prose">${rec.dias === 0
+        ? "Según el ritmo de tus depósitos, hoy debería entrar. Si ya cayó, registralo para que el disponible sea real."
+        : "Esperabas un depósito el " + fechaCorta(rec.fecha) + ", hace " + rec.dias + (rec.dias === 1 ? " día" : " días") +
+          ". Mientras no lo registrés, el disponible se queda corto."}</div>
+      <div style="display:flex;gap:10px;align-items:center;padding-top:3px">
+        <button class="link" data-act="registrarEsperado">Registrar ingreso →</button>
+        <button class="note" data-act="posponer" style="color:var(--dim)">Todavía no</button>
+      </div>
+    </div>` : ""}
     <div class="box">
       <div class="legend">
         <span class="eyebrow">Disponible este mes</span>
-        <button class="chip" data-act="sheet" data-arg="ingreso">Editar</button>
+        <button class="chip" data-act="sheet" data-arg="deposito">+ Ingreso</button>
       </div>
-      <div class="money"><span class="sym">₡</span><span class="big">${num(disp)}</span></div>
+      <div class="money"><span class="sym">₡</span>
+        <span class="big" style="color:${disp < 0 ? "var(--red)" : "var(--ink)"}">${num(disp)}</span></div>
       <div class="bar">
-        <div class="fill" style="width:${plan ? Math.min(100, (gast / plan) * 100) : 0}%"></div>
+        <div class="fill" style="width:${recibido ? Math.min(100, (gast / recibido) * 100) : 0}%"></div>
         <div class="rest"></div>
       </div>
-      <div class="legend"><span>${money(gast)} gastados</span><span>${money(plan)} planeados</span></div>
+      <div class="legend"><span>${money(gast)} gastados</span><span>${money(recibido)} recibidos</span></div>
+    </div>
+    <div class="sect">Ingreso del mes<span class="note" style="color:var(--ink);font-weight:800">${money(recibido)}</span></div>
+    ${deps.map(m => `<button class="row" data-act="sheet" data-arg="deposito:${m.id}">
+      <div class="stack">
+        <div class="name">${esc(m.comercio)}</div>
+        <div class="note">${Number(m.fecha.slice(8))} ${MESES[Number(m.fecha.slice(5, 7)) - 1].slice(0, 3)}</div>
+      </div>
+      <div class="val" style="color:var(--red-ink)">+${money(m.monto)}</div>
+    </button>`).join("")}
+    <div class="row" style="border-top:1px solid var(--hair)">
+      <div class="note">${f.label} · ${deps.length} de ${f.n} depósito${f.n === 1 ? "" : "s"} esperado${f.n === 1 ? "" : "s"}${
+        prox && !rec ? " · próximo ~" + fechaCorta(prox) : ""}</div>
+      <button class="link" data-act="sheet" data-arg="deposito">+ Agregar</button>
     </div>
     <div class="duo">
       <div>
@@ -331,7 +415,7 @@ function vistaResumen() {
       <div>
         <span class="eyebrow">Tasa de ahorro</span>
         <span class="kpi">${ahorroPct}%</span>
-        <span class="note">del ingreso</span>
+        <span class="note">de lo recibido</span>
       </div>
     </div>
     ${a ? `<div class="alerta">
@@ -351,10 +435,10 @@ function vistaResumen() {
 function filaMov(m) {
   const c = m.cat ? catPorId(m.cat) : null;
   const dia = Number(m.fecha.slice(8));
-  return `<button class="row" data-act="sheet" data-arg="mov:${m.id}">
+  return `<button class="row" data-act="sheet" data-arg="${m.ingreso ? "deposito" : "mov"}:${m.id}">
     <div class="stack">
       <div class="name">${esc(m.comercio)}</div>
-      <div class="note">${dia} ${MESES[Number(m.fecha.slice(5, 7)) - 1].slice(0, 3)} · ${c ? esc(c.nombre) : "Sin categoría"}</div>
+      <div class="note">${dia} ${MESES[Number(m.fecha.slice(5, 7)) - 1].slice(0, 3)} · ${m.ingreso ? "Ingreso" : c ? esc(c.nombre) : "Sin categoría"}</div>
     </div>
     <div class="val" style="color:${m.monto > 0 ? "var(--red-ink)" : "var(--ink)"}">${m.monto > 0 ? "+" : "−"}${money(Math.abs(m.monto))}</div>
   </button>`;
@@ -555,6 +639,66 @@ function hojaMonto(titulo, valorActual, efecto, act, fmt, extra) {
   <div class="sheet-foot"></div>`;
 }
 
+function hojaDeposito(id) {
+  const m = id ? D.movs.find(x => x.id === id) : null;
+  const n = Number(U.draft || 0);
+  const f = FREQ[D.frecuencia] || FREQ.mensual;
+  const rec = recordatorioPago(), prox = proximoEsperado();
+  const k = (U.draftFecha || "").slice(0, 7);
+  const yaEnEseMes = k ? depositosDelMes(k).filter(x => !m || x.id !== m.id).length : 0;
+  return `
+  <div class="sheet-head">
+    <div class="sheet-title">${m ? "Editar ingreso" : "Registrar ingreso"}</div>
+    <button class="x" data-act="cerrar" aria-label="Cerrar">×</button>
+  </div>
+  <div class="scroll">
+    <div class="amount">
+      <div class="money"><span class="sym">₡</span>
+        <span class="big" style="color:${U.draft ? "var(--red-ink)" : "var(--faint)"}">${U.draft ? num(n) : "0"}</span></div>
+      <div class="prose">${m ? "Cambiá el monto o la fecha de este depósito."
+        : "Anotá el pago que te acaba de entrar, no el que esperás. " + f.label +
+          ": este sería el depósito " + (yaEnEseMes + 1) + " de " + f.n + " del mes."}</div>
+    </div>
+    <div class="field">
+      <label for="fec">Fecha del depósito</label>
+      <input id="fec" type="date" data-bind="draftFecha" value="${esc(U.draftFecha)}">
+    </div>
+    <div class="field">
+      <label for="con">Concepto</label>
+      <input id="con" placeholder="Salario, freelance, comisión…" data-bind="draftTexto" value="${esc(U.draftTexto)}" autocomplete="off">
+    </div>
+    ${teclado("tecla")}
+    <button class="cta" data-act="guardarDeposito" data-arg="${m ? m.id : ""}" ${n > 0 && U.draftFecha ? "" : "disabled"}>
+      <span>${n > 0 ? (m ? "Guardar " : "Registrar ") + money(n) : "Escribí el monto"}</span><span style="font-weight:400">→</span>
+    </button>
+    ${m ? `<button class="row" data-act="borrarDeposito" data-arg="${m.id}">
+      <div class="stack"><div class="name danger">Eliminar este ingreso</div>
+      <div class="note">Se resta del total del mes</div></div>
+    </button>` : ""}
+    <div style="height:30px"></div>
+  </div>
+  <div class="sheet-foot"></div>`;
+}
+
+function hojaFrecuencia() {
+  return `
+  <div class="sheet-head">
+    <div class="sheet-title">¿Cada cuánto te pagan?</div>
+    <button class="x" data-act="cerrar" aria-label="Cerrar">×</button>
+  </div>
+  <div class="scroll">
+    <div style="padding:18px 20px 4px" class="prose">Define cuántos depósitos espera el app cada mes. No cambia nada de lo que ya registraste.</div>
+    ${Object.keys(FREQ).map(key => `<button class="row" data-act="guardarFrecuencia" data-arg="${key}"
+      style="background:${D.frecuencia === key ? "var(--tint)" : "transparent"}">
+      <div class="stack"><div class="name">${FREQ[key].label}</div>
+        <div class="note">${FREQ[key].n} depósito${FREQ[key].n === 1 ? "" : "s"} por mes</div></div>
+      <span style="font:800 13px/1 Archivo,sans-serif;color:var(--red)">${D.frecuencia === key ? "✓" : ""}</span>
+    </button>`).join("")}
+    <div style="height:30px"></div>
+  </div>
+  <div class="sheet-foot"></div>`;
+}
+
 function hojaMov(id) {
   const m = D.movs.find(x => x.id === id);
   if (!m) return "";
@@ -661,10 +805,21 @@ function hojaAjustes() {
   </div>
   <div class="scroll">
     <div style="padding:20px 20px 6px" class="eyebrow">Tu plan</div>
-    <button class="row" data-act="sheet" data-arg="ingreso">
-      <div class="stack"><div class="name">Ingreso mensual</div><div class="note">Base del disponible</div></div>
-      <div class="note" style="color:var(--ink)">${money(D.ingreso)}</div>
+    <button class="row" data-act="sheet" data-arg="frecuencia">
+      <div class="stack"><div class="name">Frecuencia de pago</div>
+        <div class="note">${(FREQ[D.frecuencia] || FREQ.mensual).n} depósito(s) esperados por mes</div></div>
+      <div class="note" style="color:var(--ink)">${(FREQ[D.frecuencia] || FREQ.mensual).label}</div>
     </button>
+    <button class="row" data-act="sheet" data-arg="esperado">
+      <div class="stack"><div class="name">Monto por pago</div>
+        <div class="note">Referencia: ${money(esperadoDelMes())} al mes</div></div>
+      <div class="note" style="color:var(--ink)">${money(D.esperado || 0)}</div>
+    </button>
+    <div class="row">
+      <div class="stack"><div class="name">Recibido en ${esc(mesLargo(k))}</div>
+        <div class="note">${depositosDelMes(k).length} depósito(s) registrados</div></div>
+      <div class="note" style="color:var(--ink)">${money(recibidoDelMes(k))}</div>
+    </div>
     <div class="row">
       <div class="stack"><div class="name">Total planeado</div><div class="note">Suma de las ${D.cats.length} categorías</div></div>
       <div class="note" style="color:var(--ink)">${money(planeado())}</div>
@@ -709,16 +864,22 @@ function hojaSetup() {
     <div class="scroll">
       ${puedeGuardar ? "" : BANNER}
       <div class="box">
-        <div style="font:800 26px/1.1 Archivo,sans-serif;letter-spacing:-.02em">¿Cuánto entra al mes?</div>
-        <div class="prose">Tu ingreso neto: lo que realmente te queda después de deducciones. Es la base de todo lo demás, así que es mejor un número conservador que uno optimista.</div>
+        <div style="font:800 26px/1.1 Archivo,sans-serif;letter-spacing:-.02em">¿Cómo te pagan?</div>
+        <div class="prose">Elegí cada cuánto entra la plata y cuánto recibís en cada pago, neto. Después vas registrando cada depósito cuando cae, y el disponible sale de ahí.</div>
       </div>
+      <div class="seg" style="padding-bottom:16px">
+        ${Object.keys(FREQ).map(key => `<button class="${(U.freq || "mensual") === key ? "on" : ""}"
+          data-act="freq" data-arg="${key}">${FREQ[key].label}</button>`).join("")}
+        <span class="cap"></span>
+      </div>
+      <div style="padding:0 20px 4px" class="eyebrow">Monto por pago</div>
       <div class="amount">
         <div class="money"><span class="sym">₡</span>
           <span class="big" style="color:${U.draft ? "var(--ink)" : "var(--faint)"}">${U.draft ? num(n) : "0"}</span></div>
       </div>
       ${teclado("tecla")}
       <button class="cta" data-act="paso2" ${n > 0 ? "" : "disabled"}>
-        <span>${n > 0 ? "Continuar" : "Escribí tu ingreso"}</span><span style="font-weight:400">→</span>
+        <span>${n > 0 ? "Continuar" : "Escribí el monto de cada pago"}</span><span style="font-weight:400">→</span>
       </button>
       <button class="row" data-act="paso2" style="border-top:0;justify-content:center">
         <span class="note">Lo defino después</span>
@@ -795,11 +956,14 @@ function renderSheet() {
   const k = U.mes;
   el.innerHTML =
     s === "setup"      ? hojaSetup() :
+    s === "deposito"   ? hojaDeposito(U.arg) :
+    s === "frecuencia" ? hojaFrecuencia() :
     s === "gasto"      ? hojaGasto() :
     s === "ajustes"    ? hojaAjustes() :
-    s === "ingreso"    ? hojaMonto("Ingreso del mes", D.ingreso,
-        v => "Con " + money(v) + " de ingreso quedan " + money(v - gastadoTotal(k)) + " disponibles y " +
-             money(Math.max(0, (v - gastadoTotal(k)) / Math.max(1, diasRestantes(k)))) + " por día.", "guardarIngreso") :
+    s === "esperado"   ? hojaMonto("Monto por pago", D.esperado || 0,
+        v => "Con " + money(v) + " " + (FREQ[D.frecuencia] || FREQ.mensual).corto + ", el app espera " +
+             money(v * (FREQ[D.frecuencia] || FREQ.mensual).n) + " al mes. Es solo una referencia: el disponible siempre sale de lo que registrás.",
+        "guardarEsperado") :
     s === "tasa"       ? hojaMonto("Rendimiento anual (%)", D.tasa,
         v => "Se usa para proyectar tus metas a 10 años. 8% es el promedio histórico de un índice amplio; un ahorro bancario en Costa Rica anda más cerca de 4%.", "guardarTasa", v => v + "%") :
     s === "plan"       ? hojaMonto("Plan de " + (catPorId(U.arg) || {}).nombre, (catPorId(U.arg) || {}).plan,
@@ -857,15 +1021,26 @@ const ACCIONES = {
   sheet(v) {
     const [s, a] = v.split(":");
     U.sheet = s; U.arg = a || null; U.draft = ""; U.draftCat = null; U.draftTexto = "";
+    if (s === "deposito") {
+      const m = a ? D.movs.find(x => x.id === a) : null;
+      U.draft = m ? String(m.monto) : "";
+      U.draftFecha = m ? m.fecha : fechaSugerida();
+      U.draftTexto = m ? m.comercio : "";
+    }
   },
-  cerrar() { U.sheet = null; U.arg = null; U.draft = ""; U.draftCat = null; U.draftTexto = ""; },
+  cerrar() { U.sheet = null; U.arg = null; U.draft = ""; U.draftCat = null; U.draftTexto = ""; U.draftFecha = ""; },
   tecla(t) {
     U.draft = t === "←" ? U.draft.slice(0, -1) : (U.draft + t).slice(0, 10);
   },
   draftCat(v) { U.draftCat = v; },
   dia(v) { U.diaSel = Number(v) === Number(U.diaSel) || Number(v) === 0 ? null : Number(v); },
 
-  paso2() { if (U.draft) D.ingreso = Number(U.draft); U.paso = 2; U.draft = ""; guardar(); },
+  freq(v) { U.freq = v; },
+  paso2() {
+    D.frecuencia = U.freq || "mensual";
+    if (U.draft) D.esperado = Number(U.draft);
+    U.paso = 2; U.draft = ""; guardar();
+  },
   paso1() { U.paso = 1; U.draft = ""; },
   toggleCat(nom) {
     U.catsSel = U.catsSel || [];
@@ -899,7 +1074,35 @@ const ACCIONES = {
     guardar(); ACCIONES.cerrar(); U.tab = "resumen";
     avisar("Registrado " + money(n) + " en " + catPorId(D.movs[D.movs.length - 1].cat).nombre);
   },
-  guardarIngreso() { D.ingreso = Number(U.draft || D.ingreso); guardar(); ACCIONES.cerrar(); },
+  guardarEsperado() { D.esperado = Number(U.draft || D.esperado || 0); guardar(); ACCIONES.cerrar(); },
+  guardarFrecuencia(v) { if (FREQ[v]) D.frecuencia = v; guardar(); ACCIONES.cerrar(); },
+  guardarDeposito(id) {
+    const n = Number(U.draft || 0), fecha = U.draftFecha;
+    if (!n || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { avisar("Falta el monto o la fecha"); return; }
+    const concepto = (U.draftTexto || "Ingreso").trim() || "Ingreso";
+    const m = id ? D.movs.find(x => x.id === id) : null;
+    if (m) { m.monto = n; m.fecha = fecha; m.comercio = concepto; }
+    else D.movs.push({ id: uid(), ingreso: true, comercio: concepto, monto: n, cat: null, fecha });
+    D.pospuesto = null;
+    U.mes = fecha.slice(0, 7);          // saltar al mes del depósito para que lo veas
+    guardar(); ACCIONES.cerrar(); U.tab = "resumen";
+    avisar((m ? "Ingreso actualizado: " : "Ingreso registrado: ") + money(n));
+  },
+  registrarEsperado() {
+    const prox = proximoEsperado();
+    ACCIONES.sheet("deposito");
+    if (prox) U.draftFecha = prox;          // la fecha deducida, no la de hoy
+    if (D.esperado) U.draft = String(D.esperado);
+  },
+  posponer() {
+    const d = hoy(); d.setDate(d.getDate() + 1);
+    D.pospuesto = isoDe(d); guardar();
+    avisar("Listo, te vuelvo a preguntar mañana");
+  },
+  borrarDeposito(id) {
+    D.movs = D.movs.filter(m => m.id !== id);
+    guardar(); ACCIONES.cerrar(); avisar("Ingreso eliminado");
+  },
   guardarTasa() { D.tasa = Math.min(30, Number(U.draft || D.tasa)); guardar(); ACCIONES.cerrar(); },
   guardarPlan() { const c = catPorId(U.arg); if (c) c.plan = Number(U.draft || c.plan); guardar(); ACCIONES.cerrar(); },
 
@@ -1001,7 +1204,7 @@ const ACCIONES = {
     U.confirmar = false;
     D = semilla(); guardar();
     U = { tab: "resumen", mes: hoyKey(), sheet: null, arg: null, draft: "", draftCat: null,
-          draftTexto: "", diaSel: null, scroll: {}, paso: 1, catsSel: [] };
+          draftTexto: "", draftFecha: "", diaSel: null, scroll: {}, paso: 1, catsSel: [], freq: "mensual" };
     avisar("Listo, empezamos de cero");
   }
 };
